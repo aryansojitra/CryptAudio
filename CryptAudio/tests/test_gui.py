@@ -1,0 +1,316 @@
+"""GUI tests for the CryptAudio desktop interface (Phase 6).
+
+These tests focus on **GUI behaviour only** — widget construction, default
+state, password masking, input validation, correct delegation to the service
+layer (via mocks), and safe error presentation. The 78 backend tests already
+cover crypto/audio/steganography/integration, so they are intentionally not
+duplicated here.
+
+Heavy backend calls are mocked so no real encryption or large-file embedding
+happens during a GUI test. Tests are skipped automatically if no Tk display is
+available.
+
+Run the FULL regression suite from the project root::
+
+    .venv\\Scripts\\python.exe -m pytest -v
+"""
+
+from __future__ import annotations
+
+import time
+import tkinter as tk
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from gui import embed_tab as embed_module
+from gui import extract_tab as extract_module
+from gui.embed_tab import EmbedTab, describe_service_error, format_bytes
+from gui.extract_tab import ExtractTab
+from gui.main_window import MainWindow
+from services.cryptaudio_service import (
+    AuthenticationFailureError,
+    CapacityExceededError,
+    EmbedResult,
+    NoHiddenMessageError,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures / helpers.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session")
+def _tk():
+    """A single hidden Tk root for the whole session.
+
+    Only ONE ``Tk()`` interpreter should exist per process; creating many leads
+    to flaky teardown errors ('invalid command name "tcl_findLibrary"'). Tests
+    therefore share this root and each gets its own ``Toplevel`` below.
+    """
+    try:
+        win = tk.Tk()
+    except tk.TclError as exc:  # pragma: no cover - headless environments
+        pytest.skip(f"Tk display unavailable: {exc}")
+    win.withdraw()
+    try:
+        yield win
+    finally:
+        win.destroy()
+
+
+@pytest.fixture
+def root(_tk):
+    """A fresh withdrawn Toplevel per test (destroyed afterwards)."""
+    top = tk.Toplevel(_tk)
+    top.withdraw()
+    try:
+        yield top
+    finally:
+        top.destroy()
+
+
+def _flush(tab, timeout: float = 5.0) -> None:
+    """Wait for the worker thread, then drive the main-thread poll loop.
+
+    The worker only enqueues its result; the tab delivers it via a poll loop
+    scheduled with ``after`` on the main thread. We join the worker, then pump
+    Tk events until the tab is no longer busy (i.e. the result was handled).
+    """
+    if getattr(tab, "_worker", None) is not None:
+        tab._worker.join(timeout=timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tab.update()
+        if not tab._busy:
+            break
+        time.sleep(0.02)
+
+
+def _fake_embed_result(output_path: str = "out.wav") -> EmbedResult:
+    return EmbedResult(
+        output_path=output_path,
+        encrypted_payload_bytes=256,
+        used_bytes=269,
+        capacity_bytes=4096,
+        available_payload_bytes=4083,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Construction / structure.
+# --------------------------------------------------------------------------- #
+def test_main_window_constructs_with_two_tabs(root):
+    win = MainWindow(root)
+    tabs = win.notebook.tabs()
+    assert len(tabs) == 2
+    labels = [win.notebook.tab(t, "text") for t in tabs]
+    assert any("Embed" in text for text in labels)
+    assert any("Extract" in text for text in labels)
+
+
+def test_main_window_starts_on_embed_tab_with_ready_status(root):
+    win = MainWindow(root)
+    selected = win.notebook.tab(win.notebook.select(), "text")
+    assert "Embed" in selected
+    assert win.status_var.get() == "Ready"
+
+
+def test_embed_tab_has_required_widgets(root):
+    tab = EmbedTab(root)
+    for name in ("cover_entry", "message_text", "password_entry",
+                 "output_entry", "embed_btn", "result_label", "open_folder_btn"):
+        assert hasattr(tab, name), f"EmbedTab missing widget '{name}'"
+
+
+def test_extract_tab_has_required_widgets(root):
+    tab = ExtractTab(root)
+    for name in ("stego_entry", "message_text", "password_entry",
+                 "extract_btn", "result_label"):
+        assert hasattr(tab, name), f"ExtractTab missing widget '{name}'"
+
+
+def test_password_fields_are_masked(root):
+    assert str(EmbedTab(root).password_entry.cget("show")) == "*"
+    assert str(ExtractTab(root).password_entry.cget("show")) == "*"
+
+
+def test_embed_default_state_is_valid(root):
+    tab = EmbedTab(root)
+    assert str(tab.embed_btn.cget("state")) == "normal"
+    assert str(tab.open_folder_btn.cget("state")) == "disabled"
+    assert tab.channels_var.get() == "--"
+    assert tab.capacity_var.get() == "--"
+    assert tab.msg_size_var.get() == "--"
+    assert tab.capacity_status_var.get() == "Waiting for audio"
+
+
+def test_extract_message_widget_starts_read_only(root):
+    tab = ExtractTab(root)
+    assert str(tab.message_text.cget("state")) == "disabled"
+
+
+# --------------------------------------------------------------------------- #
+# Input validation (no backend call).
+# --------------------------------------------------------------------------- #
+def test_embed_validation_blocks_empty_fields(root, monkeypatch):
+    tab = EmbedTab(root)
+    mock_embed = Mock(return_value=_fake_embed_result())
+    monkeypatch.setattr(embed_module, "embed_message", mock_embed)
+
+    tab._on_embed()  # all fields empty
+
+    assert mock_embed.call_count == 0
+    assert tab._worker is None
+    assert "\u2717" in tab.result_var.get()
+
+
+def test_extract_validation_blocks_empty_fields(root, monkeypatch):
+    tab = ExtractTab(root)
+    mock_extract = Mock(return_value="secret")
+    monkeypatch.setattr(extract_module, "extract_message", mock_extract)
+
+    tab._on_extract()  # all fields empty
+
+    assert mock_extract.call_count == 0
+    assert "\u2717" in tab.result_var.get()
+
+
+# --------------------------------------------------------------------------- #
+# Correct delegation to the service layer.
+# --------------------------------------------------------------------------- #
+def test_embed_invokes_service_with_gui_inputs(root, monkeypatch):
+    tab = EmbedTab(root)
+    mock_embed = Mock(return_value=_fake_embed_result("C:/out/stego.wav"))
+    monkeypatch.setattr(embed_module, "embed_message", mock_embed)
+
+    tab.cover_path_var.set("C:/in/cover.wav")
+    tab.output_path_var.set("C:/out/stego.wav")
+    tab.message_text.insert("1.0", "top secret payload")
+    tab.password_var.set("hunter2")
+
+    tab._on_embed()
+    _flush(tab)
+
+    mock_embed.assert_called_once_with(
+        "C:/in/cover.wav", "C:/out/stego.wav", "top secret payload", "hunter2"
+    )
+    assert "embedded successfully" in tab.result_var.get()
+    assert "C:/out/stego.wav" in tab.result_var.get()
+    assert str(tab.open_folder_btn.cget("state")) == "normal"
+    # Password is cleared from the field after a successful embed.
+    assert tab.password_var.get() == ""
+
+
+def test_extract_invokes_service_and_shows_plaintext(root, monkeypatch):
+    tab = ExtractTab(root)
+    mock_extract = Mock(return_value="recovered plaintext")
+    monkeypatch.setattr(extract_module, "extract_message", mock_extract)
+
+    tab.stego_path_var.set("C:/in/stego.wav")
+    tab.password_var.set("hunter2")
+
+    tab._on_extract()
+    _flush(tab)
+
+    mock_extract.assert_called_once_with("C:/in/stego.wav", "hunter2")
+    assert "recovered plaintext" in tab.message_text.get("1.0", "end-1c")
+    assert "extracted successfully" in tab.result_var.get()
+    assert tab.password_var.get() == ""
+
+
+def test_metadata_is_fetched_from_backend_not_duplicated(root, monkeypatch):
+    tab = EmbedTab(root)
+    fake_info = SimpleNamespace(
+        channels=2, frame_rate=44100, sample_width_bits=16, duration_seconds=3.5
+    )
+    mock_inspect = Mock(return_value=fake_info)
+    mock_capacity = Mock(return_value=123456)
+    monkeypatch.setattr(embed_module, "inspect_wav", mock_inspect)
+    monkeypatch.setattr(embed_module, "available_capacity_bytes", mock_capacity)
+
+    tab.cover_path_var.set("C:/in/cover.wav")
+    tab._load_audio_info()
+
+    mock_inspect.assert_called_once_with("C:/in/cover.wav")
+    mock_capacity.assert_called_once_with("C:/in/cover.wav")
+    assert tab.channels_var.get() == "2"
+    assert "44,100" in tab.rate_var.get()
+    assert "16-bit" in tab.width_var.get()
+
+
+# --------------------------------------------------------------------------- #
+# Safe error presentation (no class names / tracebacks leaked).
+# --------------------------------------------------------------------------- #
+def test_embed_capacity_error_is_user_friendly(root, monkeypatch):
+    tab = EmbedTab(root)
+    monkeypatch.setattr(
+        embed_module, "embed_message",
+        Mock(side_effect=CapacityExceededError("too big")),
+    )
+    tab.cover_path_var.set("C:/in/cover.wav")
+    tab.output_path_var.set("C:/out/stego.wav")
+    tab.message_text.insert("1.0", "x" * 10)
+    tab.password_var.set("pw")
+
+    tab._on_embed()
+    _flush(tab)
+
+    text = tab.result_var.get()
+    assert "too large" in text
+    assert "CapacityExceededError" not in text
+
+
+def test_extract_wrong_password_is_user_friendly(root, monkeypatch):
+    tab = ExtractTab(root)
+    monkeypatch.setattr(
+        extract_module, "extract_message",
+        Mock(side_effect=AuthenticationFailureError("bad tag")),
+    )
+    tab.stego_path_var.set("C:/in/stego.wav")
+    tab.password_var.set("wrong")
+
+    tab._on_extract()
+    _flush(tab)
+
+    text = tab.result_var.get()
+    assert "Incorrect password or corrupted hidden data." in text
+    assert "AuthenticationFailureError" not in text
+
+
+def test_extract_clean_wav_reports_no_message(root, monkeypatch):
+    tab = ExtractTab(root)
+    monkeypatch.setattr(
+        extract_module, "extract_message",
+        Mock(side_effect=NoHiddenMessageError("none")),
+    )
+    tab.stego_path_var.set("C:/in/clean.wav")
+    tab.password_var.set("pw")
+
+    tab._on_extract()
+    _flush(tab)
+
+    assert "No valid CryptAudio message" in tab.result_var.get()
+
+
+@pytest.mark.parametrize(
+    "exc, expected_fragment, forbidden",
+    [
+        (CapacityExceededError("x"), "too large", "CapacityExceededError"),
+        (AuthenticationFailureError("x"), "Incorrect password",
+         "AuthenticationFailureError"),
+        (NoHiddenMessageError("x"), "No valid CryptAudio message",
+         "NoHiddenMessageError"),
+    ],
+)
+def test_describe_service_error_hides_internals(exc, expected_fragment,
+                                                forbidden):
+    text = describe_service_error(exc)
+    assert expected_fragment in text
+    assert forbidden not in text
+
+
+def test_format_bytes_renders_readable_sizes():
+    assert format_bytes(512) == "512 B"
+    assert format_bytes(2048) == "2.0 KB"
+    assert format_bytes(5 * 1024 * 1024) == "5.00 MB"
