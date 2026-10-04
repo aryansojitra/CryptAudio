@@ -29,6 +29,7 @@ from gui import extract_tab as extract_module
 from gui.embed_tab import EmbedTab, describe_service_error, format_bytes
 from gui.extract_tab import ExtractTab
 from gui.main_window import MainWindow
+from gui.responsive import get_breakpoint
 from services.cryptaudio_service import (
     AuthenticationFailureError,
     CapacityExceededError,
@@ -100,39 +101,42 @@ def _fake_embed_result(output_path: str = "out.wav") -> EmbedResult:
 # --------------------------------------------------------------------------- #
 # Construction / structure.
 # --------------------------------------------------------------------------- #
-def test_main_window_constructs_with_two_tabs(root):
+def test_main_window_constructs_with_responsive_pages(root):
     win = MainWindow(root)
-    tabs = win.notebook.tabs()
-    assert len(tabs) == 2
-    labels = [win.notebook.tab(t, "text") for t in tabs]
-    assert any("Embed" in text for text in labels)
-    assert any("Extract" in text for text in labels)
+    assert set(win._pages) == {"overview", "embed", "extract", "analysis", "settings"}
+    assert win.current_page == "overview"
+    assert win.breakpoint == get_breakpoint(root.winfo_width())
+    assert win.footer._right_var.get() == "READY"
 
 
-def test_main_window_starts_on_embed_tab_with_ready_status(root):
+def test_main_window_navigation_preserves_page_state(root):
     win = MainWindow(root)
-    selected = win.notebook.tab(win.notebook.select(), "text")
-    assert "Embed" in selected
-    assert win.status_var.get() == "Ready"
+    win._navigate("embed")
+    root.update_idletasks()
+    page = win._pages["embed"]
+    page.message_text.text_widget.insert("1.0", "keep this")
+    win._navigate("extract")
+    win._navigate("embed")
+    assert page.message_text.get() == "keep this"
 
 
 def test_embed_tab_has_required_widgets(root):
     tab = EmbedTab(root)
-    for name in ("cover_entry", "message_text", "password_entry",
-                 "output_entry", "embed_btn", "result_label", "open_folder_btn"):
+    for name in ("file_card", "message_text", "password_entry",
+                 "output_entry", "embed_btn", "status_banner", "open_folder_btn"):
         assert hasattr(tab, name), f"EmbedTab missing widget '{name}'"
 
 
 def test_extract_tab_has_required_widgets(root):
     tab = ExtractTab(root)
-    for name in ("stego_entry", "message_text", "password_entry",
-                 "extract_btn", "result_label"):
+    for name in ("file_card", "message_text", "password_entry",
+                 "extract_btn", "status_banner"):
         assert hasattr(tab, name), f"ExtractTab missing widget '{name}'"
 
 
 def test_password_fields_are_masked(root):
-    assert str(EmbedTab(root).password_entry.cget("show")) == "*"
-    assert str(ExtractTab(root).password_entry.cget("show")) == "*"
+    assert str(EmbedTab(root).password_entry.entry.cget("show")) == "\u2022"
+    assert str(ExtractTab(root).password_entry.entry.cget("show")) == "\u2022"
 
 
 def test_embed_default_state_is_valid(root):
@@ -147,7 +151,7 @@ def test_embed_default_state_is_valid(root):
 
 def test_extract_message_widget_starts_read_only(root):
     tab = ExtractTab(root)
-    assert str(tab.message_text.cget("state")) == "disabled"
+    assert str(tab.message_text.text_widget.cget("state")) == "disabled"
 
 
 # --------------------------------------------------------------------------- #
@@ -162,7 +166,7 @@ def test_embed_validation_blocks_empty_fields(root, monkeypatch):
 
     assert mock_embed.call_count == 0
     assert tab._worker is None
-    assert "\u2717" in tab.result_var.get()
+    assert "Please select a cover WAV file" in tab.status_banner._text_label.cget("text")
 
 
 def test_extract_validation_blocks_empty_fields(root, monkeypatch):
@@ -173,7 +177,7 @@ def test_extract_validation_blocks_empty_fields(root, monkeypatch):
     tab._on_extract()  # all fields empty
 
     assert mock_extract.call_count == 0
-    assert "\u2717" in tab.result_var.get()
+    assert "Please select a stego WAV file" in tab.status_banner._text_label.cget("text")
 
 
 # --------------------------------------------------------------------------- #
@@ -186,7 +190,7 @@ def test_embed_invokes_service_with_gui_inputs(root, monkeypatch):
 
     tab.cover_path_var.set("C:/in/cover.wav")
     tab.output_path_var.set("C:/out/stego.wav")
-    tab.message_text.insert("1.0", "top secret payload")
+    tab.message_text.text_widget.insert("1.0", "top secret payload")
     tab.password_var.set("hunter2")
 
     tab._on_embed()
@@ -195,9 +199,9 @@ def test_embed_invokes_service_with_gui_inputs(root, monkeypatch):
     mock_embed.assert_called_once_with(
         "C:/in/cover.wav", "C:/out/stego.wav", "top secret payload", "hunter2"
     )
-    assert "embedded successfully" in tab.result_var.get()
-    assert "C:/out/stego.wav" in tab.result_var.get()
-    assert str(tab.open_folder_btn.cget("state")) == "normal"
+    assert "embedded successfully" in tab.status_banner._text_label.cget("text")
+    assert "stego.wav" in tab.status_banner._text_label.cget("text")
+    assert not tab.open_folder_btn._disabled
     # Password is cleared from the field after a successful embed.
     assert tab.password_var.get() == ""
 
@@ -214,8 +218,8 @@ def test_extract_invokes_service_and_shows_plaintext(root, monkeypatch):
     _flush(tab)
 
     mock_extract.assert_called_once_with("C:/in/stego.wav", "hunter2")
-    assert "recovered plaintext" in tab.message_text.get("1.0", "end-1c")
-    assert "extracted successfully" in tab.result_var.get()
+    assert "recovered plaintext" in tab.message_text.get()
+    assert "extracted successfully" in tab.status_banner._text_label.cget("text")
     assert tab.password_var.get() == ""
 
 
@@ -250,13 +254,13 @@ def test_embed_capacity_error_is_user_friendly(root, monkeypatch):
     )
     tab.cover_path_var.set("C:/in/cover.wav")
     tab.output_path_var.set("C:/out/stego.wav")
-    tab.message_text.insert("1.0", "x" * 10)
+    tab.message_text.text_widget.insert("1.0", "x" * 10)
     tab.password_var.set("pw")
 
     tab._on_embed()
     _flush(tab)
 
-    text = tab.result_var.get()
+    text = tab.status_banner._text_label.cget("text")
     assert "too large" in text
     assert "CapacityExceededError" not in text
 
@@ -273,8 +277,8 @@ def test_extract_wrong_password_is_user_friendly(root, monkeypatch):
     tab._on_extract()
     _flush(tab)
 
-    text = tab.result_var.get()
-    assert "Incorrect password or corrupted hidden data." in text
+    text = tab.status_banner._text_label.cget("text")
+    assert "incorrect password or corrupted hidden data." in text
     assert "AuthenticationFailureError" not in text
 
 
@@ -290,14 +294,14 @@ def test_extract_clean_wav_reports_no_message(root, monkeypatch):
     tab._on_extract()
     _flush(tab)
 
-    assert "No valid CryptAudio message" in tab.result_var.get()
+    assert "No valid CryptAudio message" in tab.status_banner._text_label.cget("text")
 
 
 @pytest.mark.parametrize(
     "exc, expected_fragment, forbidden",
     [
         (CapacityExceededError("x"), "too large", "CapacityExceededError"),
-        (AuthenticationFailureError("x"), "Incorrect password",
+        (AuthenticationFailureError("x"), "incorrect password",
          "AuthenticationFailureError"),
         (NoHiddenMessageError("x"), "No valid CryptAudio message",
          "NoHiddenMessageError"),
@@ -314,3 +318,59 @@ def test_format_bytes_renders_readable_sizes():
     assert format_bytes(512) == "512 B"
     assert format_bytes(2048) == "2.0 KB"
     assert format_bytes(5 * 1024 * 1024) == "5.00 MB"
+
+
+@pytest.mark.parametrize(
+    "width, expected_bp, expected_sidebar, expected_analysis_columns",
+    [
+        (1400, "wide", "wide", 3),
+        (1200, "wide", "wide", 3),
+        (1000, "medium", "medium", 2),
+        (900, "medium", "medium", 2),
+        (800, "medium", "medium", 2),
+        (760, "narrow", "narrow", 1),
+    ],
+)
+def test_responsive_breakpoints_and_analysis_grid(
+    root, width, expected_bp, expected_sidebar, expected_analysis_columns
+):
+    win = MainWindow(root)
+    root.deiconify()
+    root.geometry(f"{width}x700")
+    root.update_idletasks()
+    win._apply_breakpoint()
+    root.update_idletasks()
+
+    assert win.breakpoint == expected_bp
+    assert win.sidebar.state == expected_sidebar
+    assert win._pages["analysis"]._metrics_grid.columns == expected_analysis_columns
+    assert win.sidebar._nav_buttons["overview"].winfo_width() > 0
+    assert win.sidebar._nav_buttons["overview"].winfo_height() > 0
+
+    win._navigate("embed")
+    root.update_idletasks()
+    page = win._pages["embed"]
+    assert page.embed_btn.winfo_ismapped()
+    assert page.password_entry.winfo_width() >= 180
+
+
+def test_resize_preserves_embed_state_and_stacks_audio_cards(root):
+    win = MainWindow(root)
+    root.deiconify()
+    win._navigate("embed")
+    page = win._pages["embed"]
+    page.cover_path_var.set("C:/in/cover.wav")
+    page.message_text.text_widget.insert("1.0", "preserved message")
+
+    root.geometry("1400x900")
+    root.update_idletasks()
+    win._apply_breakpoint()
+    root.geometry("760x560")
+    root.update_idletasks()
+    win._apply_breakpoint()
+    root.update_idletasks()
+
+    assert page.cover_path_var.get() == "C:/in/cover.wav"
+    assert page.message_text.get() == "preserved message"
+    assert page._audio_grid.columns == 1
+    assert page.embed_btn.winfo_ismapped()

@@ -20,26 +20,23 @@ normally playable and perceptually near-identical to the original.
 ## Current Status
 
 ```text
-Phase 6 — Desktop GUI (COMPLETE)
+Phase 7 — Audio Quality Evaluation (COMPLETE)
 ```
 
 **Done:** environment (Phase 1); AES-256-GCM + PBKDF2 cryptography (Phase 2);
 PCM WAV handling (Phase 3); LSB steganography (Phase 4); the integration service
-layer (Phase 5); and a Tkinter/`ttk` desktop GUI (Phase 6). The GUI is a thin
-view over the frozen backend — `gui/main_window.py` hosts a `ttk.Notebook` with
-🔐 Embed and 🔓 Extract tabs that call only
-`services/cryptaudio_service.embed_message()` / `extract_message()` /
-`available_capacity_bytes()` and `audio.wav_handler.inspect_wav()` for metadata.
-No crypto/WAV/LSB logic lives in the GUI. Long operations run on a worker
-thread and marshal results back to the main thread via a queue + `after()` poll
-loop, buttons are disabled while busy, passwords are masked and cleared after
-use, and service exceptions are translated into friendly messages (no class
-names or tracebacks are ever shown).
-Test suite: crypto + audio + steganography + integration + GUI
-(97 tests, all passing).
+layer (Phase 5); a Tkinter/`ttk` desktop GUI (Phase 6); and audio quality
+evaluation (Phase 7). The evaluation module (`evaluation/audio_quality.py`)
+computes MSE, SNR, PSNR, and sample-modification statistics by comparing decoded
+PCM samples (not raw bytes) between cover and stego WAVs, supporting 8/16/24/32-bit
+PCM without truncation. Real experiment on a 10-second stereo 16-bit WAV:
+**MSE ≈ 0.001, SNR ≈ 101 dB, PSNR ≈ 120 dB, only 0.098% of samples modified,
+max sample difference = 1** — confirming LSB steganography is virtually inaudible.
+Test suite: crypto + audio + steganography + integration + GUI + audio quality
+(111 tests, all passing).
 
-**Not yet implemented:** audio-quality evaluation and the remaining phases
-(7–10).
+**Not yet implemented:** security testing, documentation, and presentation
+(Phases 8–10).
 
 ### Running the application
 
@@ -100,7 +97,8 @@ CryptAudio/
 │   ├── test_steganography.py
 │   ├── test_audio.py
 │   ├── test_integration.py
-│   └── test_gui.py
+│   ├── test_gui.py
+│   └── test_audio_quality.py
 ├── samples/
 │   └── .gitkeep
 └── output/
@@ -163,7 +161,7 @@ installed via pip.
 | 4 | LSB steganography — **DONE** |
 | 5 | Integration — **DONE** |
 | 6 | GUI — **DONE** |
-| 7 | Evaluation (MSE, SNR) |
+| 7 | Evaluation (MSE, SNR, PSNR) — **DONE** |
 | 8 | Security testing |
 | 9 | Documentation |
 | 10 | Presentation & viva |

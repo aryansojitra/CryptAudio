@@ -20,10 +20,12 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from gui.main_window import MainWindow  # noqa: E402  (import after path setup)
+from gui.theme import set_dpi_awareness  # noqa: E402
 
 
 def main() -> int:
     """Create the main window and start the Tkinter event loop."""
+    set_dpi_awareness()
     try:
         root = tk.Tk()
     except tk.TclError as exc:  # e.g. no display available

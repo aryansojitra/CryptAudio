@@ -1,40 +1,50 @@
-"""CryptAudio — Extract tab (Phase 6).
+"""CryptAudio — Extract page (Phase 6 UI Redesign).
 
-A thin Tkinter view over :func:`services.cryptaudio_service.extract_message`.
-No cryptographic or LSB logic lives here — the tab collects a stego WAV and a
-password, calls the service, and presents the plaintext (or a safe, friendly
-error). Shared GUI helpers are imported from :mod:`gui.embed_tab`.
+Thin presentation layer over services.cryptaudio_service.extract_message.
+All backend logic (threading, queue+poll, validation, error mapping) is
+preserved identically — only the visual layout changes.
 """
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
 
 from audio.wav_handler import WavError, inspect_wav
-from gui.embed_tab import COLORS, describe_service_error
+from gui.embed_tab import describe_service_error, format_bytes
+from gui.responsive import ResponsiveGrid
+from gui.theme import COLORS, ICONS, SPACING
+from gui.widgets import (
+    Card,
+    FileDropCard,
+    MetricCard,
+    PasswordEntry,
+    PrimaryButton,
+    SecondaryButton,
+    StatusBanner,
+    StyledText,
+)
 from services.cryptaudio_service import ServiceError, extract_message
 
 
-class ExtractTab(ttk.Frame):
-    """The '\U0001F513 Extract Message' tab."""
+class ExtractPage(ttk.Frame):
+    """The Extract Message page — responsive dark dashboard layout."""
 
-    def __init__(self, parent, set_status=None) -> None:
-        super().__init__(parent, padding=12)
-        self._set_status = set_status or (lambda *a, **k: None)
+    def __init__(self, parent, app=None, **kwargs):
+        super().__init__(parent, style="TFrame", **kwargs)
+        self._app = app
         self._busy = False
         self._worker: threading.Thread | None = None
-        # Workers never touch Tkinter directly; they push results here and a
-        # poll loop scheduled on the main thread drains it (thread-safe).
         self._results: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
         self._build_vars()
         self._build_ui()
 
-    # -- construction ----------------------------------------------------- #
-    def _build_vars(self) -> None:
+    # -- variables -------------------------------------------------------- #
+    def _build_vars(self):
         self.stego_path_var = tk.StringVar()
         self.password_var = tk.StringVar()
 
@@ -43,106 +53,145 @@ class ExtractTab(ttk.Frame):
         self.width_var = tk.StringVar(value="--")
         self.duration_var = tk.StringVar(value="--")
 
-        self.result_var = tk.StringVar(value="")
-
-    def _build_ui(self) -> None:
+    # -- UI construction -------------------------------------------------- #
+    def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)  # let the message box expand
+        self.rowconfigure(0, weight=1)
 
-        self._build_audio_section(0)
-        self._build_security_section(1)
-        self._build_message_section(2)
-        self._build_action_bar(3)
-        self._build_result_area(4)
+        container = ttk.Frame(self, style="TFrame", padding=SPACING["xl"])
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=1)  # message area expands
 
-    def _section(self, row: int, title: str, sticky: str = "ew") -> ttk.LabelFrame:
-        frame = ttk.LabelFrame(self, text=title, style="Section.TLabelframe")
-        frame.grid(row=row, column=0, sticky=sticky, pady=(0, 10))
-        frame.columnconfigure(1, weight=1)
-        return frame
+        # Title.
+        title_frame = ttk.Frame(container, style="TFrame")
+        title_frame.grid(row=0, column=0, sticky="ew", pady=(0, SPACING["lg"]))
+        tk.Label(title_frame, text="Extract Message", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Recover a hidden encrypted message from a stego WAV file",
+                 bg=COLORS["bg"], fg=COLORS["text_muted"],
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
 
-    # A. Stego WAV selection + info ---------------------------------------- #
-    def _build_audio_section(self, row: int) -> None:
-        frame = self._section(row, "Audio")
-        ttk.Label(frame, text="Stego Audio", style="Meta.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 8), pady=4
-        )
-        self.stego_entry = ttk.Entry(frame, textvariable=self.stego_path_var)
-        self.stego_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        self.browse_btn = ttk.Button(frame, text="Browse",
-                                     command=self._browse_stego)
-        self.browse_btn.grid(row=0, column=2, sticky="e", padx=(8, 0), pady=4)
+        # Source audio + info cards.
+        self._audio_grid = ResponsiveGrid(container, min_card_width=320)
+        self._audio_grid.grid(row=1, column=0, sticky="ew", pady=(0, SPACING["lg"]))
+        self._build_source_card()
+        self._build_info_card()
 
-        meta = ttk.Frame(frame)
-        meta.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-        for c in range(8):
-            meta.columnconfigure(c, weight=1)
-        self._meta_labels = [
-            ("Channels", self.channels_var),
-            ("Sample Rate", self.rate_var),
-            ("Sample Width", self.width_var),
-            ("Duration", self.duration_var),
-        ]
-        for i, (caption, var) in enumerate(self._meta_labels):
-            cell = ttk.Frame(meta)
-            cell.grid(row=0, column=i * 2, columnspan=2, sticky="w",
-                      padx=(0, 12))
-            ttk.Label(cell, text=f"{caption}:", style="Meta.TLabel").pack(
-                anchor="w"
-            )
-            ttk.Label(cell, textvariable=var, style="MetaValue.TLabel").pack(
-                anchor="w"
-            )
+        # Password.
+        self._build_password_card(container, row=2)
 
-    # C. Password ---------------------------------------------------------- #
-    def _build_security_section(self, row: int) -> None:
-        frame = self._section(row, "Security")
-        ttk.Label(frame, text="Password", style="Meta.TLabel").grid(
-            row=0, column=0, sticky="w", padx=(0, 8), pady=4
-        )
-        self.password_entry = ttk.Entry(frame, textvariable=self.password_var,
-                                        show="*")
-        self.password_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        # Recovered message.
+        self._build_message_card(container, row=3)
 
-    # Extracted message area (read-only, but selectable/copyable) ---------- #
-    def _build_message_section(self, row: int) -> None:
-        frame = self._section(row, "Extracted Message", sticky="nsew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
+        # Action bar + status.
+        self._build_action_bar(container, row=4)
 
-        self.message_text = tk.Text(
-            frame, height=10, wrap="word", font=("Segoe UI", 11),
-            relief="solid", borderwidth=1, padx=6, pady=6, state="disabled",
-            background="#fbfcfd",
-        )
-        self.message_text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(frame, orient="vertical",
-                               command=self.message_text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.message_text.configure(yscrollcommand=scroll.set)
+    def _build_source_card(self):
+        card = Card(self._audio_grid)
+        inner = card.inner
+        inner.columnconfigure(0, weight=1)
 
-    # D. Action bar -------------------------------------------------------- #
-    def _build_action_bar(self, row: int) -> None:
-        bar = ttk.Frame(self)
-        bar.grid(row=row, column=0, sticky="ew", pady=(2, 8))
-        self.extract_btn = ttk.Button(
-            bar, text="\U0001F513 Extract Message", style="Primary.TButton",
-            command=self._on_extract,
-        )
-        self.extract_btn.pack(side="left")
-        self.copy_btn = ttk.Button(bar, text="Copy", command=self._copy_message,
-                                   state="disabled")
-        self.copy_btn.pack(side="left", padx=(10, 0))
+        tk.Label(inner, text="STEGO AUDIO", bg=COLORS["card"],
+                 fg=COLORS["text_muted"], font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, SPACING["sm"]))
 
-    def _build_result_area(self, row: int) -> None:
-        self.result_label = ttk.Label(
-            self, textvariable=self.result_var, justify="left", anchor="w",
-            wraplength=900, style="Meta.TLabel",
-        )
-        self.result_label.grid(row=row, column=0, sticky="ew")
+        self.file_card = FileDropCard(inner, on_browse=self._browse_stego)
+        self.file_card.grid(row=1, column=0, sticky="ew")
+
+        self._audio_grid.add(card)
+
+    def _build_info_card(self):
+        card = Card(self._audio_grid)
+        inner = card.inner
+        inner.columnconfigure(0, weight=1)
+
+        tk.Label(inner, text="AUDIO INFORMATION", bg=COLORS["card"],
+                 fg=COLORS["text_muted"], font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, SPACING["sm"]))
+
+        self._info_grid = ResponsiveGrid(inner, min_card_width=140, spacing=SPACING["sm"])
+        self._info_grid.grid(row=1, column=0, sticky="ew")
+
+        self._info_cards = {}
+        for label, var in [("Sample Rate", self.rate_var), ("Channels", self.channels_var),
+                           ("Sample Width", self.width_var), ("Duration", self.duration_var)]:
+            mc = MetricCard(self._info_grid, label=label, value="--")
+            self._info_grid.add(mc)
+            self._info_cards[label] = mc
+
+        self._audio_grid.add(card)
+
+    def _build_password_card(self, container, row):
+        card = Card(container)
+        card.grid(row=row, column=0, sticky="ew", pady=(0, SPACING["lg"]))
+        inner = card.inner
+        inner.columnconfigure(0, weight=1)
+
+        tk.Label(inner, text="PASSWORD", bg=COLORS["card"],
+                 fg=COLORS["text_muted"], font=("Segoe UI", 9, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, SPACING["sm"]))
+
+        self.password_entry = PasswordEntry(inner, textvariable=self.password_var)
+        self.password_entry.grid(row=1, column=0, sticky="ew")
+
+        tk.Label(inner, text="Must match the password used during embedding",
+                 bg=COLORS["card"], fg=COLORS["text_dim"],
+                 font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", pady=(SPACING["xs"], 0))
+
+    def _build_message_card(self, container, row):
+        card = Card(container)
+        card.grid(row=row, column=0, sticky="nsew", pady=(0, SPACING["lg"]))
+        inner = card.inner
+        inner.columnconfigure(0, weight=1)
+        inner.rowconfigure(1, weight=1)
+
+        header = tk.Frame(inner, bg=COLORS["card"])
+        header.grid(row=0, column=0, sticky="ew", pady=(0, SPACING["sm"]))
+        tk.Label(header, text="RECOVERED MESSAGE", bg=COLORS["card"],
+                 fg=COLORS["text_muted"], font=("Segoe UI", 9, "bold")).pack(side="left")
+
+        self.copy_btn = SecondaryButton(header, text="Copy", icon=ICONS["copy"],
+                                        command=self._copy_message, min_width=80, height=30)
+        self.copy_btn.pack(side="right")
+        self.copy_btn.set_disabled(True)
+
+        self.message_text = StyledText(inner, height=8, read_only=True)
+        self.message_text.grid(row=1, column=0, sticky="nsew")
+
+    def _build_action_bar(self, container, row):
+        bar = ttk.Frame(container, style="TFrame")
+        bar.grid(row=row, column=0, sticky="ew")
+        bar.columnconfigure(0, weight=1)
+
+        self.status_banner = StatusBanner(bar)
+        self.status_banner.grid(row=0, column=0, sticky="ew", pady=(0, SPACING["md"]))
+
+        btn_frame = ttk.Frame(bar, style="TFrame")
+        btn_frame.grid(row=1, column=0, sticky="ew")
+        btn_frame.columnconfigure(0, weight=1)
+
+        self.extract_btn = PrimaryButton(btn_frame, text="Extract Message", icon=ICONS["extract"],
+                                         command=self._on_extract, min_width=180, height=42)
+        self._action_frame = btn_frame
+        self._layout_actions("wide")
+
+    # -- responsive callback ---------------------------------------------- #
+    def on_breakpoint(self, bp: str):
+        self._audio_grid.set_columns(1 if bp == "narrow" else 2)
+        self._layout_actions(bp)
+
+    def _layout_actions(self, bp: str):
+        self.extract_btn.grid_forget()
+        if bp == "narrow":
+            self._action_frame.columnconfigure(0, weight=1)
+            self.extract_btn.grid(row=0, column=0, sticky="ew")
+        else:
+            self._action_frame.columnconfigure(0, weight=1)
+            self.extract_btn.grid(row=0, column=1, sticky="e")
 
     # -- behaviour -------------------------------------------------------- #
-    def _browse_stego(self) -> None:
+    def _browse_stego(self):
         path = filedialog.askopenfilename(
             title="Select stego WAV audio",
             filetypes=[("WAV audio", "*.wav"), ("All files", "*.*")],
@@ -152,60 +201,69 @@ class ExtractTab(ttk.Frame):
         self.stego_path_var.set(path)
         self._load_audio_info()
 
-    def _load_audio_info(self) -> None:
+    def _load_audio_info(self):
         path = self.stego_path_var.get()
         try:
             info = inspect_wav(path)
         except (WavError, ServiceError) as exc:
             self._reset_metadata()
-            self._show_result(describe_service_error(exc), "error")
-            self._set_status("Could not read the selected audio.", "error")
+            self.status_banner.set(describe_service_error(exc), "error")
+            self._set_app_status("Could not read audio", "error")
             return
 
+        self.file_card.set_file(
+            os.path.basename(path),
+            f"{info.frame_rate:,} Hz \u00B7 {info.channels}ch \u00B7 {info.sample_width_bits}-bit"
+        )
         self.channels_var.set(str(info.channels))
         self.rate_var.set(f"{info.frame_rate:,} Hz")
         self.width_var.set(f"{info.sample_width_bits}-bit")
         self.duration_var.set(f"{info.duration_seconds:.2f} s")
-        self._show_result("", "info")
-        self._set_status("Audio loaded.", "info")
 
-    def _reset_metadata(self) -> None:
-        for var in (self.channels_var, self.rate_var, self.width_var,
-                    self.duration_var):
+        for label, mc in self._info_cards.items():
+            mc.set_value(getattr(self, {"Sample Rate": "rate_var", "Channels": "channels_var",
+                                        "Sample Width": "width_var", "Duration": "duration_var"}[label]).get())
+
+        self.status_banner.clear()
+        self._set_app_status("Audio loaded", "success")
+
+    def _reset_metadata(self):
+        for var in (self.channels_var, self.rate_var, self.width_var, self.duration_var):
             var.set("--")
+        for mc in self._info_cards.values():
+            mc.set_value("--")
+        self.file_card.clear()
 
     def _validate(self) -> str | None:
         if not self.stego_path_var.get().strip():
-            return "\u2717 Please select a stego WAV file."
+            return "Please select a stego WAV file."
         if not self.password_var.get():
-            return "\u2717 Please enter a password."
+            return "Please enter a password."
         return None
 
-    # -- extract workflow ------------------------------------------------- #
-    def _on_extract(self) -> None:
+    # -- extract workflow (threading preserved) ---------------------------- #
+    def _on_extract(self):
         if self._busy:
             return
         error = self._validate()
         if error:
-            self._show_result(error, "error")
-            self._set_status("Cannot extract — check the highlighted fields.",
-                             "error")
+            self.status_banner.set(error, "error")
+            self._set_app_status("Validation failed", "error")
             return
 
         stego = self.stego_path_var.get().strip()
         password = self.password_var.get()
 
         self._set_busy(True)
-        self._show_result("", "info")
-        self._set_status("Extracting message...", "busy")
+        self.status_banner.set("Extracting message...", "loading")
+        self._set_app_status("EXTRACTING...", "busy")
+
         self._worker = threading.Thread(
-            target=self._extract_worker, args=(stego, password), daemon=True,
-        )
+            target=self._extract_worker, args=(stego, password), daemon=True)
         self._worker.start()
         self._poll_results()
 
-    def _extract_worker(self, stego, password) -> None:
-        # Runs off the main thread: performs NO Tkinter calls, only enqueues.
+    def _extract_worker(self, stego, password):
         try:
             plaintext = extract_message(stego, password)
         except ServiceError as exc:
@@ -215,8 +273,7 @@ class ExtractTab(ttk.Frame):
         else:
             self._results.put(("success", plaintext))
 
-    def _poll_results(self) -> None:
-        # Always runs on the main thread, so calling after()/widgets is safe.
+    def _poll_results(self):
         try:
             kind, payload = self._results.get_nowait()
         except queue.Empty:
@@ -228,46 +285,42 @@ class ExtractTab(ttk.Frame):
         else:
             self._on_extract_error(payload)
 
-    def _on_extract_success(self, plaintext: str) -> None:
+    def _on_extract_success(self, plaintext: str):
         self._set_busy(False)
-        self.password_var.set("")  # clear the password once used
-        self._set_message_text(plaintext)
-        self._show_result("\u2713 Message extracted successfully", "success")
-        self._set_status("Message extracted successfully.", "success")
+        self.password_var.set("")
+        self.message_text.set(plaintext)
+        self.copy_btn.set_disabled(False)
+        self.status_banner.set("Message extracted successfully", "success")
+        self._set_app_status("EXTRACTED", "success")
 
-    def _on_extract_error(self, exc) -> None:
+    def _on_extract_error(self, exc):
         self._set_busy(False)
-        self._set_message_text("")
-        message = describe_service_error(exc) if exc is not None else (
-            "\u2717 An unexpected error occurred while extracting."
-        )
-        self._show_result(message, "error")
-        self._set_status("Extraction failed.", "error")
+        self.message_text.clear()
+        self.copy_btn.set_disabled(True)
+        msg = describe_service_error(exc) if exc is not None else "An unexpected error occurred."
+        self.status_banner.set(msg, "error")
+        self._set_app_status("EXTRACT FAILED", "error")
 
-    def _set_message_text(self, text: str) -> None:
-        self.message_text.configure(state="normal")
-        self.message_text.delete("1.0", "end")
-        if text:
-            self.message_text.insert("1.0", text)
-        self.message_text.configure(state="disabled")
-        self.copy_btn.configure(state="normal" if text else "disabled")
-
-    def _copy_message(self) -> None:
-        text = self.message_text.get("1.0", "end-1c")
+    def _copy_message(self):
+        text = self.message_text.get()
         if text:
             self.clipboard_clear()
             self.clipboard_append(text)
-            self._set_status("Extracted message copied to clipboard.", "info")
+            self._set_app_status("Copied to clipboard", "success")
 
     # -- shared UI helpers ------------------------------------------------ #
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, busy: bool):
         self._busy = busy
-        state = "disabled" if busy else "normal"
-        self.extract_btn.configure(state=state)
-        self.browse_btn.configure(state=state)
-        self.password_entry.configure(state=state)
-        self.stego_entry.configure(state=state)
+        self.extract_btn.set_disabled(busy)
+        self.password_entry.configure_state("disabled" if busy else "normal")
 
-    def _show_result(self, text: str, kind: str) -> None:
-        self.result_var.set(text)
-        self.result_label.configure(foreground=COLORS.get(kind, COLORS["info"]))
+    def _set_app_status(self, text: str, kind: str = "info"):
+        if self._app:
+            color = {"success": COLORS["success"], "error": COLORS["error"],
+                     "busy": COLORS["warning"]}.get(kind, COLORS["text_muted"])
+            self._app.set_status(text, color)
+
+
+# Compatibility name retained for integrations that imported the pre-redesign
+# class.
+ExtractTab = ExtractPage
